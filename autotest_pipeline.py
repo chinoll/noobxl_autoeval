@@ -1,9 +1,3 @@
-"""
-画师风格模型推理脚本
-支持两种模式：
-1. 聚类模式：提取特征向量用于聚类
-2. 分类模式：直接输出分类结果
-"""
 import argparse
 import csv
 import json
@@ -31,15 +25,8 @@ def get_args_parser():
                         help='Model architecture')
     parser.add_argument('--checkpoint', required=True, type=str,
                         help='Path to model checkpoint')
-    parser.add_argument('--num-classes', default=None, type=int,
-                        help='Number of classes. If omitted, will try to infer from checkpoint or CSV mapping.')
     parser.add_argument('--input-size', default=224, type=int,
                         help='Input image size')
-    
-    # 推理模式
-    parser.add_argument('--mode', default='classify', type=str,
-                        choices=['classify', 'cluster', 'both'],
-                        help='Inference mode: classify (with head), cluster (features only), or both')
     
     # 输入输出
     parser.add_argument('--input', required=True, type=str,
@@ -54,10 +41,6 @@ def get_args_parser():
                         help='Device to use')
     parser.add_argument('--batch-size', default=32, type=int,
                         help='Batch size for batch inference')
-    parser.add_argument('--allow-head-reinit', action='store_true', default=False,
-                        help='Allow re-initializing classification head when checkpoint classes mismatch')
-    parser.add_argument('--top-k', default=5, type=int,
-                        help='Number of top predictions to show (default: 5)')
     parser.add_argument('--threshold', default=0.0, type=float,
                         help='Probability threshold to filter predictions (default: 0.0)')
     
@@ -75,28 +58,18 @@ def load_checkpoint_state(checkpoint_path: str):
     return checkpoint
 
 
-def resolve_num_classes(num_classes_arg: Optional[int],
-                        class_mapping: Optional[Dict[int, str]],
-                        state_dict) -> int:
+def check_and_get_num_classes(class_mapping: Optional[Dict[int, str]],state_dict) -> int:
     """根据参数、CSV 或 checkpoint 推断类别数"""
     # 优先使用CSV中的类别数
     if class_mapping:
         csv_classes = len(class_mapping)
-        if num_classes_arg is not None and num_classes_arg != csv_classes:
-            print(f"[Warning] 提供的 num_classes={num_classes_arg} 与 CSV 中的类别数 {csv_classes} 不一致，已使用 CSV 的值。")
-        return csv_classes
-
-    # 如果没有CSV，使用参数
-    if num_classes_arg is not None:
-        return num_classes_arg
-
     # 最后尝试从权重中解析分类头大小
     for key, value in state_dict.items():
         if key.endswith('head.weight') or key.endswith('head.l.weight'):
-            return value.shape[0]
-
-    raise ValueError('无法推断 num_classes，请提供 CSV 映射文件或显式指定 num_classes 参数。')
-
+            weight_classes = value.shape[0]
+    if csv_classes != weight_classes:
+        raise ValueError("权重的类别与CSV文件中不一致，请检查下载的权重或CSV")
+    return csv_classes
 
 
 
@@ -108,11 +81,10 @@ def load_model(args, state_dict):
         args.model,
         pretrained=False,
         num_classes=args.num_classes,
-        feature_dim=args.feature_dim,
     )
     model.to(args.device)
     model.eval()
-    model.load_state_dict(state_dict, strict=False)
+    model.load_state_dict(state_dict, strict=True)
     print(f"Model loaded from {args.checkpoint}")
     return model
 
@@ -186,23 +158,12 @@ def process_single_image(args, model, transform, class_mapping: Optional[Dict[in
     
     results = {}
     
-    # 分类模式
-    if args.mode in ['classify', 'both']:
-        print("\n[Classification Results]")
-        classification = classify_image(model, image_tensor, args.device, class_mapping, args.threshold)
-        results['classification'] = classification
-        
-        for i, result in enumerate(classification, 1):
-            print(f"{i}. {result['class_name']}: {result['probability']:.4f}")
+    print("\n[Classification Results]")
+    classification = classify_image(model, image_tensor, args.device, class_mapping, args.threshold)
+    results['classification'] = classification
     
-    # 聚类模式（提取特征）
-    if args.mode in ['cluster', 'both']:
-        print("\n[Feature Extraction]")
-        features = extract_features(model, image_tensor, args.device)
-        results['features'] = features[0].tolist()
-        print(f"Feature vector shape: {features.shape}")
-        print(f"Feature vector (first 10 dims): {features[0][:10]}")
-    
+    for i, result in enumerate(classification, 1):
+        print(f"{i}. {result['class_name']}: {result['probability']:.4f}")
     return results
 
 
@@ -300,16 +261,12 @@ def main(args):
     # 创建输出目录
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    if args.mode in ['classify', 'both'] and not args.class_csv:
-        raise ValueError('分类或混合模式下必须提供 --class-csv，且需使用训练阶段导出的映射文件。')
-
     # 加载类别映射
     class_mapping = load_class_mapping(args.class_csv)
 
     # 加载 checkpoint 并解析类别数
     state_dict = load_checkpoint_state(args.checkpoint)
-    args.num_classes = resolve_num_classes(args.num_classes, class_mapping, state_dict)
+    args.num_classes = check_and_get_num_classes(class_mapping, state_dict)
 
     # 加载模型
     model = load_model(args, state_dict)
