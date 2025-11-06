@@ -248,7 +248,7 @@ def process_directory(args, model, transform, class_mapping: Optional[Dict[int, 
     return all_results
 
 
-def main(args):
+def get_artist(args):
     # 根据模型配置动态设置输入大小
     from model.lsnet_artist import default_cfgs_artist
     if args.model in default_cfgs_artist:
@@ -317,7 +317,8 @@ def main(args):
     else:
         print(f"Error: Invalid input path: {input_path}")
 
-
+def main(args):
+    get_artist(args)
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('Artist Style Inference', parents=[get_args_parser()])
     args = parser.parse_args()
