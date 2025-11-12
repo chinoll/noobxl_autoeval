@@ -11,6 +11,9 @@ from timm.data import resolve_data_config
 from timm.data.transforms_factory import create_transform
 from timm.models import create_model
 from torchvision import transforms as T
+import pandas as pd
+from huggingface_hub import hf_hub_download
+
 # Ensure custom LSNet artist models are registered with timm
 from model import lsnet_artist  # noqa: F401
 
@@ -119,55 +122,6 @@ def preprocess_image(image_path, transform):
     tensor = transform(image)
     return tensor.unsqueeze(0)
 
-
-def classify_image(model, image_tensor, device, class_mapping: Optional[Dict[int, str]] = None, threshold=0.7):
-    """对图像进行分类"""
-    with torch.no_grad():
-        image_tensor = image_tensor.to(device)
-        # 使用分类头
-        logits = model(image_tensor, return_features=False)
-        
-        # 计算概率
-        probs = F.softmax(logits, dim=-1)
-        
-        # Top-K结果
-        top_probs, top_indices = torch.topk(probs, k=min(5, probs.size(-1)), dim=-1)
-        
-        results = []
-        for prob, idx in zip(top_probs[0].cpu().numpy(), top_indices[0].cpu().numpy()):
-            if prob >= threshold:
-                class_name = class_mapping.get(int(idx), f"Class {idx}") if class_mapping else f"Class {idx}"
-                results.append({
-                    'class_id': int(idx),
-                    'class_name': class_name,
-                    'probability': float(prob)
-                })
-        
-        return results
-
-def process_single_image(args, model, transform, class_mapping: Optional[Dict[int, str]] = None):
-    """处理单张图像"""
-    image_path = Path(args.input)
-    if not image_path.exists():
-        print(f"Error: Image not found: {image_path}")
-        return
-    
-    print(f"\nProcessing: {image_path.name}")
-    
-    # 预处理
-    image_tensor = preprocess_image(image_path, transform)
-    
-    results = {}
-    
-    print("\n[Classification Results]")
-    classification = classify_image(model, image_tensor, args.device, class_mapping, args.threshold)
-    results['classification'] = classification
-    
-    for i, result in enumerate(classification, 1):
-        print(f"{i}. {result['class_name']}: {result['probability']:.4f}")
-    return results
-
-
 def process_directory(args, transform, callback_fn, class_mapping,threshold):
     """批量处理目录中的图像"""
     input_dir = Path(args.input)
@@ -270,8 +224,6 @@ def generate_image_from_sdxl(args):
     pass
 def get_character(args):
     pass
-import pandas as pd
-from huggingface_hub import hf_hub_download
 
 def get_danbooru_tags(args):
     model = create_model(f'hf-hub:{args.danbooru_model_checkpoint}', pretrained=True).cuda()
@@ -288,8 +240,7 @@ def get_danbooru_tags(args):
         keep_default_na=False
     )
     tags_mapping = {int(k):v for k,v in zip(range(len(df_tags['name'])),df_tags['name'])}
-    from rich import print
-    # print(tags_mapping[4])
+
     def process_fn(tensors):
         output = model(tensors)
         prediction = torch.sigmoid(output)
@@ -300,7 +251,7 @@ def get_danbooru_tags(args):
 def main(args):
     # generate_image_from_sdxl(args)
     get_artist(args)
-    # get_danbooru_tags(args)
+    get_danbooru_tags(args)
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('Artist Style Inference', parents=[get_args_parser()])
     args = parser.parse_args()
