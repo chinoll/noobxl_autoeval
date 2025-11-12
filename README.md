@@ -30,13 +30,6 @@ python autoeval_pipeline.py --artist-model-checkpoint /path/to/your/model \
 - 评测结果将保存在 `output/inference/` 和 `result/` 目录下，格式为 JSON。
 - 示例：`result/result.json`
 
-## 目录结构说明
-- `model/`：模型相关代码（如 lsnet、ska 等）。
-- `output/`：推理输出。
-- `result/`：评测结果。
-- `test_dir/`：测试图片示例。
-- `misc_code/`：其他辅助脚本。
-
 ## 使用的模型
 - 画师分类：`lsnet_xl_artist_448`
 - danbooru：[danbooru 分类模型](https://huggingface.co/spaces/animetimm/dbv4-full-ranklist)
