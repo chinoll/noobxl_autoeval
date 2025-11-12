@@ -4,14 +4,13 @@ import json
 from pathlib import Path
 from typing import Dict, Optional
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
 from timm.data import resolve_data_config
 from timm.data.transforms_factory import create_transform
 from timm.models import create_model
-
+from torchvision import transforms as T
 # Ensure custom LSNet artist models are registered with timm
 from model import lsnet_artist  # noqa: F401
 
@@ -19,31 +18,33 @@ from model import lsnet_artist  # noqa: F401
 def get_args_parser():
     parser = argparse.ArgumentParser('Artist Style Inference', add_help=False)
     
-    # 模型参数
-    parser.add_argument('--model', default='lsnet_t_artist', type=str,
-                        choices=['lsnet_t_artist', 'lsnet_s_artist', 'lsnet_b_artist', 'lsnet_l_artist', 'lsnet_xl_artist', 'lsnet_xl_artist_448'],
-                        help='Model architecture')
-    parser.add_argument('--checkpoint', required=True, type=str,
-                        help='Path to model checkpoint')
-    parser.add_argument('--input-size', default=224, type=int,
-                        help='Input image size')
+
+    parser.add_argument('--danbooru-model-name', required=False, type=str,
+                        help='danbooru model name')
     
     # 输入输出
     parser.add_argument('--input', required=True, type=str,
                         help='Input image path or directory')
     parser.add_argument('--output', default='./output/inference', type=str,
                         help='Output directory')
-    parser.add_argument('--class-csv', default=None, type=str,
-                        help='Path to class mapping CSV exported during training')
+
     
     # 其他参数
     parser.add_argument('--device', default='cuda', type=str,
                         help='Device to use')
     parser.add_argument('--batch-size', default=32, type=int,
                         help='Batch size for batch inference')
-    parser.add_argument('--threshold', default=0.0, type=float,
-                        help='Probability threshold to filter predictions (default: 0.0)')
     
+    #画师分类相关参数设置
+    parser.add_argument('--artist_threshold', default=0.4, type=float,
+                        help='Probability threshold to filter predictions (default: 0.0)')
+    parser.add_argument('--artist-class-csv', default=None, type=str,
+                        help='Path to class mapping CSV exported during training')
+    parser.add_argument('--artist-model-type', default='lsnet_xl_artist_448', type=str,
+                        choices=['lsnet_xl_artist_448'],
+                        help='Model architecture')
+    parser.add_argument('--artist-model-checkpoint', required=False, type=str,
+                        help='Path to artist model checkpoint')
     return parser
 
 
@@ -75,17 +76,17 @@ def check_and_get_num_classes(class_mapping: Optional[Dict[int, str]],state_dict
 
 def load_model(args, state_dict):
     """加载模型"""
-    print(f"Loading model: {args.model}")
+    print(f"Loading model: {args.artist_model_type}")
 
     model = create_model(
-        args.model,
+        args.artist_model_type,
         pretrained=False,
         num_classes=args.num_classes,
     )
     model.to(args.device)
     model.eval()
     model.load_state_dict(state_dict, strict=True)
-    print(f"Model loaded from {args.checkpoint}")
+    print(f"Model loaded from {args.artist_model_checkpoint}")
     return model
 
 
@@ -167,23 +168,12 @@ def process_single_image(args, model, transform, class_mapping: Optional[Dict[in
     return results
 
 
-def process_directory(args, model, transform, class_mapping: Optional[Dict[int, str]] = None):
+def process_directory(args, transform, callback_fn, class_mapping,threshold):
     """批量处理目录中的图像"""
     input_dir = Path(args.input)
-    if not input_dir.is_dir():
-        print(f"Error: Directory not found: {input_dir}")
-        return
-    
-    # 支持的图像格式
     image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp'}
     image_paths = [p for p in input_dir.glob('**/*') if p.suffix.lower() in image_extensions]
-    
-    if not image_paths:
-        print(f"No images found in {input_dir}")
-        return
-    
     print(f"Found {len(image_paths)} images")
-    
     all_results = {}
     
     # 批量处理
@@ -208,11 +198,8 @@ def process_directory(args, model, transform, class_mapping: Optional[Dict[int, 
         # 推理
         with torch.no_grad():
             batch_tensor = batch_tensor.to(args.device)
-            
-            if args.mode in ['classify', 'both']:
-                logits = model(batch_tensor, return_features=False)
-                probs = F.softmax(logits, dim=-1)
-                top_probs, top_indices = torch.topk(probs, k=min(args.top_k, probs.size(-1)), dim=-1)
+            probs = callback_fn(batch_tensor)
+            top_probs, top_indices = torch.topk(probs, k=probs.size(-1), dim=-1)
         
         # 保存结果
         for j, path in enumerate(batch_paths):
@@ -220,26 +207,20 @@ def process_directory(args, model, transform, class_mapping: Optional[Dict[int, 
                 continue
             
             result = {'image': path.name}
+
+            img_top_probs = top_probs[j].cpu().numpy()
+            img_top_indices = top_indices[j].cpu().numpy()
             
-            if args.mode in ['classify', 'both']:
-                # 获取该图像的 top-k 结果
-                img_top_probs = top_probs[j].cpu().numpy()
-                img_top_indices = top_indices[j].cpu().numpy()
-                
-                classifications = []
-                for prob, idx in zip(img_top_probs, img_top_indices):
-                    if prob >= args.threshold:
-                        class_id = int(idx)
-                        class_name = class_mapping.get(class_id, f"Class {class_id}") if class_mapping else f"Class {class_id}"
-                        classifications.append({
-                            'class_id': class_id,
-                            'class_name': class_name,
-                            'probability': float(prob)
-                        })
-                
-                # 如果需要，取前 top_k
-                if len(classifications) > args.top_k:
-                    classifications = classifications[:args.top_k]
+            classifications = []
+            for prob, idx in zip(img_top_probs, img_top_indices):
+                class_id = int(idx)
+                if class_id in class_mapping and prob >= threshold[int(idx)]:
+                    class_name = class_mapping[class_id]
+                    classifications.append({
+                        'class_id': class_id,
+                        'class_name': class_name,
+                        'probability': float(prob)
+                    })
                 
                 result['classification'] = classifications
             all_results[path.name] = result
@@ -249,23 +230,16 @@ def process_directory(args, model, transform, class_mapping: Optional[Dict[int, 
 
 
 def get_artist(args):
-    # 根据模型配置动态设置输入大小
-    from model.lsnet_artist import default_cfgs_artist
-    if args.model in default_cfgs_artist:
-        model_cfg = default_cfgs_artist[args.model]
-        configured_input_size = model_cfg.get('input_size', (3, 224, 224))[1]  # 获取高度（假设正方形）
-        if args.input_size != configured_input_size:
-            args.input_size = configured_input_size
-            print(f"Auto-setting input_size to {configured_input_size} for model {args.model} (from config)")
-    
+    args.input_size = 448
+    # args.artist_model_type = 'lsnet_xl_artist_448'
     # 创建输出目录
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
     # 加载类别映射
-    class_mapping = load_class_mapping(args.class_csv)
+    class_mapping = load_class_mapping(args.artist_class_csv)
 
     # 加载 checkpoint 并解析类别数
-    state_dict = load_checkpoint_state(args.checkpoint)
+    state_dict = load_checkpoint_state(args.artist_model_checkpoint)
     args.num_classes = check_and_get_num_classes(class_mapping, state_dict)
 
     # 加载模型
@@ -277,48 +251,56 @@ def get_artist(args):
     
     # 判断输入类型
     input_path = Path(args.input)
-    
-    if input_path.is_file():
-        # 单张图像
-        results = process_single_image(args, model, transform, class_mapping)
-        
-        # 保存结果
-        output_file = output_dir / f"{input_path.stem}_result.json"
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
-        print(f"\nResults saved to: {output_file}")
-        
-    elif input_path.is_dir():
+    def process_fn(inputs):
+        logits = model(inputs, return_features=False)
+        probs = F.softmax(logits, dim=-1)
+        return probs
+    if input_path.is_dir():
         # 目录批量处理
-        results = process_directory(args, model, transform, class_mapping)
-        
+        results = process_directory(args, transform, process_fn,class_mapping, [args.artist_threshold] * len(class_mapping))
         # 保存结果
         output_file = output_dir / "batch_results.json"
         with open(output_file, 'w', encoding='utf-8') as f:
             json.dump(results, f, indent=2, ensure_ascii=False)
         print(f"\nResults saved to: {output_file}")
-        
-        # 如果是聚类模式，额外保存特征矩阵
-        if args.mode in ['cluster', 'both']:
-            features_list = []
-            image_names = []
-            for name, result in results.items():
-                if 'features' in result:
-                    features_list.append(result['features'])
-                    image_names.append(name)
-            
-            if features_list:
-                features_array = np.array(features_list)
-                np.save(output_dir / "features.npy", features_array)
-                with open(output_dir / "image_names.txt", 'w') as f:
-                    f.write('\n'.join(image_names))
-                print(f"Feature matrix saved: {output_dir / 'features.npy'}")
-                print(f"Feature matrix shape: {features_array.shape}")
     else:
         print(f"Error: Invalid input path: {input_path}")
 
+def generate_image_from_sdxl(args):
+    pass
+def get_character(args):
+    pass
+import pandas as pd
+from huggingface_hub import hf_hub_download
+
+def get_danbooru_tags(args):
+    model = create_model(f'hf-hub:{args.danbooru_model_checkpoint}', pretrained=True).cuda()
+    data_config = resolve_data_config(model=model)
+    model.eval()
+    preprocessor = T.Compose([
+        T.Resize(size=data_config['input_size'][-1], antialias=True),
+        T.CenterCrop(size=data_config['input_size'][1:]),
+        T.ToTensor(),
+        T.Normalize(mean=[0.4850, 0.4560, 0.4060], std=[0.2290, 0.2240, 0.2250]),
+    ])
+    df_tags = pd.read_csv(
+        hf_hub_download(repo_id=args.danbooru_model_checkpoint, repo_type='model', filename='selected_tags.csv'),
+        keep_default_na=False
+    )
+    tags_mapping = {int(k):v for k,v in zip(range(len(df_tags['name'])),df_tags['name'])}
+    from rich import print
+    # print(tags_mapping[4])
+    def process_fn(tensors):
+        output = model(tensors)
+        prediction = torch.sigmoid(output)
+        return prediction
+
+    result = process_directory(args,preprocessor,process_fn,tags_mapping,df_tags['best_threshold'])
+    print(result)
 def main(args):
+    # generate_image_from_sdxl(args)
     get_artist(args)
+    # get_danbooru_tags(args)
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('Artist Style Inference', parents=[get_args_parser()])
     args = parser.parse_args()
