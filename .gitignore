@@ -1,3 +1,5 @@
 result/
 all_artists.txt
 __pycache__/
+output/
+test_dir
