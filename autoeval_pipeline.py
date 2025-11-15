@@ -30,7 +30,8 @@ def get_args_parser():
                         help='Input image path or directory')
     parser.add_argument('--output', default='./output/inference', type=str,
                         help='Output directory')
-
+    parser.add_argument('--answer', required=False, type=str,
+                        help='answer')
     
     # 其他参数
     parser.add_argument('--device', default='cuda', type=str,
@@ -77,7 +78,7 @@ def check_and_get_num_classes(class_mapping: Optional[Dict[int, str]],state_dict
 
 
 
-def load_model(args, state_dict):
+def load_artist_model(args, state_dict):
     """加载模型"""
     print(f"Loading model: {args.artist_model_type}")
 
@@ -157,9 +158,6 @@ def process_directory(args, transform, callback_fn, class_mapping,threshold):
         
         # 保存结果
         for j, path in enumerate(batch_paths):
-            if j >= len(batch_tensors):
-                continue
-            
             result = {'image': path.name}
 
             img_top_probs = top_probs[j].cpu().numpy()
@@ -197,36 +195,117 @@ def get_artist(args):
     args.num_classes = check_and_get_num_classes(class_mapping, state_dict)
 
     # 加载模型
-    model = load_model(args, state_dict)
+    model = load_artist_model(args, state_dict)
     
     # 创建数据转换
     config = resolve_data_config({'input_size': (3, args.input_size, args.input_size)}, model=model)
     transform = create_transform(**config)
     
     # 判断输入类型
-    input_path = Path(args.input)
     def process_fn(inputs):
         logits = model(inputs, return_features=False)
         probs = F.softmax(logits, dim=-1)
         return probs
-    if input_path.is_dir():
-        # 目录批量处理
-        results = process_directory(args, transform, process_fn,class_mapping, [args.artist_threshold] * len(class_mapping))
-        # 保存结果
-        output_file = output_dir / "batch_results.json"
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
-        print(f"\nResults saved to: {output_file}")
-    else:
-        print(f"Error: Invalid input path: {input_path}")
+    results = process_directory(args, transform, process_fn,class_mapping, [args.artist_threshold] * len(class_mapping))
+    return results
 
 def generate_image_from_sdxl(args):
     pass
-def get_character(args):
-    pass
+def postprocess_result(args,artist_result, danbooru_result):
+    merged_results = {}
+    df_tags = pd.read_csv(
+        hf_hub_download(repo_id=args.danbooru_model_name, repo_type='model', filename='selected_tags.csv'),
+        keep_default_na=False
+    )
+    tags_mapping = {k:int(v) for k,v in zip(df_tags['name'],df_tags['category'])}
+    # 以 artist_result 为主遍历
+    for img_name, artist_info in artist_result.items():
+        image_path = artist_info.get("image", img_name)
+        artist_names = [c["class_name"] for c in artist_info.get("classification", [])]
+        # 获取 danbooru 标签
+        danbooru_info = danbooru_result.get(img_name, {})
+        danbooru_names = [c["class_name"] for c in danbooru_info.get("classification", [])]
+        merged_results[image_path] = {
+            "artist": artist_names,
+            "general":[i for i in danbooru_names if tags_mapping[i] == 0],
+            "character":[i for i in danbooru_names if tags_mapping[i] == 4],
+            "rating":[i for i in danbooru_names if tags_mapping[i] == 9]
+        }
+    return merged_results
+
+def get_model_score(pred, target_path):
+    stats = {
+        'artist': {},
+        'general': {},
+        'character': {},
+        'rating': {}
+    }
+    # 加载目标答案
+    with open(target_path, encoding="utf-8") as f:
+        target = json.load(f)
+
+    def update_stats(category, label, answer_set):
+        if label not in stats[category]:
+            stats[category][label] = {'total': 0, 'correct': 0}
+        stats[category][label]['total'] += 1
+        if label in answer_set:
+            stats[category][label]['correct'] += 1
+
+    # 遍历每张图片的预测结果
+    for img_name, pred_info in pred.items():
+        artist_set = set(target[img_name].get('artist', []))
+        general_set = set(target[img_name].get('general', []))
+        character_set = set(target[img_name].get('character', []))
+        rating_set = set(target[img_name].get('rating', []))
+        for label in pred_info.get('artist', []):
+            update_stats('artist', label, artist_set)
+        for label in pred_info.get('general', []):
+            update_stats('general', label, general_set)
+        for label in pred_info.get('character', []):
+            update_stats('character', label, character_set)
+        for label in pred_info.get('rating', []):
+            update_stats('rating', label, rating_set)
+
+    # 计算准确率
+    score = {
+        cat: {label: (info['correct'] / info['total'] if info['total'] > 0 else 0)
+              for label, info in stats[cat].items()}
+        for cat in stats
+    }
+    return stats,score
+
+def visualization_results(stats, score):
+    """
+    可视化每个大分类的平均准确率、加权平均准确率、最低的10个子标签。
+    """
+    import matplotlib.pyplot as plt
+    import numpy as np
+    
+    for cat in ['artist', 'general', 'character', 'rating']:
+        print(f"\n分类: {cat}")
+        # 平均准确率
+        avg_acc = np.mean(list(score[cat].values())) if score[cat] else 0
+        print(f"平均准确率: {avg_acc:.4f}")
+        # 加权平均准确率
+        total = sum(stats[cat][k]['total'] for k in stats[cat])
+        weighted_acc = sum(stats[cat][k]['correct'] for k in stats[cat]) / total if total > 0 else 0
+        print(f"加权平均准确率: {weighted_acc:.4f}")
+        # 最低的10个子标签
+        sorted_labels = sorted(score[cat].items(), key=lambda x: x[1])
+        print("最低的10个子标签:")
+        for label, acc in sorted_labels[:10]:
+            print(f"  {label}: {acc:.4f} (样本数: {stats[cat][label]['total']})")
+        # 可视化准确率分布
+        plt.figure(figsize=(10, 4))
+        plt.hist(list(score[cat].values()), bins=30, color='skyblue', edgecolor='black')
+        plt.title(f"{cat} 标签准确率分布")
+        plt.xlabel("准确率")
+        plt.ylabel("标签数量")
+        plt.tight_layout()
+        plt.show()
 
 def get_danbooru_tags(args):
-    model = create_model(f'hf-hub:{args.danbooru_model_checkpoint}', pretrained=True).cuda()
+    model = create_model(f'hf-hub:{args.danbooru_model_name}', pretrained=True).cuda()
     data_config = resolve_data_config(model=model)
     model.eval()
     preprocessor = T.Compose([
@@ -236,7 +315,7 @@ def get_danbooru_tags(args):
         T.Normalize(mean=[0.4850, 0.4560, 0.4060], std=[0.2290, 0.2240, 0.2250]),
     ])
     df_tags = pd.read_csv(
-        hf_hub_download(repo_id=args.danbooru_model_checkpoint, repo_type='model', filename='selected_tags.csv'),
+        hf_hub_download(repo_id=args.danbooru_model_name, repo_type='model', filename='selected_tags.csv'),
         keep_default_na=False
     )
     tags_mapping = {int(k):v for k,v in zip(range(len(df_tags['name'])),df_tags['name'])}
@@ -247,11 +326,20 @@ def get_danbooru_tags(args):
         return prediction
 
     result = process_directory(args,preprocessor,process_fn,tags_mapping,df_tags['best_threshold'])
-    print(result)
+    return result
+
 def main(args):
-    # generate_image_from_sdxl(args)
-    get_artist(args)
-    get_danbooru_tags(args)
+    create_output_dir(args)
+    generate_image_from_sdxl(args)
+    artist = get_artist(args)
+    danbooru = get_danbooru_tags(args)
+    result = postprocess_result(args,artist,danbooru)
+    if args.answer is not None:
+        stats,score = get_model_score(result,args.answer)
+        # print(score)
+        visualization_results(stats,score)
+def create_output_dir(args):
+    pass
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('Artist Style Inference', parents=[get_args_parser()])
     args = parser.parse_args()
